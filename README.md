@@ -40,5 +40,3 @@ The locked version degrades as threads contend on the single mutex. The lock-fre
 ## References
 
 - Herlihy, Lev, Luchangco, Shavit. *A Provably Correct Scalable Concurrent Skip List.* OPODIS 2006. https://www.cs.tau.ac.il/~shanir/nir-pubs-web/Papers/OPODIS2006-BA.pdf
-- Harris. *A Pragmatic Implementation of Non-Blocking Linked-Lists.* DISC 2001. (origin of the mark-bit / CAS deletion pattern used here)
-- Herlihy & Shavit. *The Art of Multiprocessor Programming*, Chapter 14.
