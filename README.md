@@ -15,8 +15,6 @@ The lock-free implementation uses the standard mark-then-unlink deletion pattern
 2. Deletions mark from the top level down, finishing at level 0 (the deciding level)
 3. Any thread that encounters a marked node during `find` physically unlinks it via CAS (the helping pattern)
 
-Memory reclamation is deferred — unlinked nodes leak until destruction. A production implementation would need hazard pointers or epoch-based reclamation.
-
 ## Build and run
 
 ```
