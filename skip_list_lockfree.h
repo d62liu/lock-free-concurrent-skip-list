@@ -4,6 +4,7 @@
 #include <limits>
 #include <random>
 #include <cstdint>
+#include "epoch.h"
 
 struct LFNode {
     int key;
@@ -34,6 +35,11 @@ class LockFreeSkipList {
 
     LFNode* head;
     std::atomic<int> current_level;
+    EBR ebr;
+
+    static void delete_node(void* p) {
+        delete static_cast<LFNode*>(p);
+    }
 
     int random_level() {
         thread_local std::mt19937 rng(std::random_device{}());
@@ -60,6 +66,7 @@ public:
     }
 
     bool find(int key) {
+        EBR::Guard guard(&ebr);
         LFNode* preds[MAX_LEVEL];
         LFNode* succs[MAX_LEVEL];
         return find(key, preds, succs);
@@ -102,6 +109,7 @@ public:
     }
 
     bool insert(int key) {
+        EBR::Guard guard(&ebr);
         LFNode* preds[MAX_LEVEL];
         LFNode* succs[MAX_LEVEL];
 
@@ -152,6 +160,7 @@ public:
     }
 
     bool remove(int key) {
+        EBR::Guard guard(&ebr);
         LFNode* preds[MAX_LEVEL];
         LFNode* succs[MAX_LEVEL];
 
@@ -181,7 +190,9 @@ public:
                     pack(get_ptr(raw), true),
                     std::memory_order_acq_rel,
                     std::memory_order_acquire)) {
+
                 find(key, preds, succs);
+                guard.retire(target, &delete_node);
                 return true;
             }
         }
