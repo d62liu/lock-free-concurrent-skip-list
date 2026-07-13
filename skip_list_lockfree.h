@@ -34,7 +34,6 @@ class LockFreeSkipList {
     static constexpr float P = 0.5f;
 
     LFNode* head;
-    std::atomic<int> current_level;
     EBR ebr;
 
     static void delete_node(void* p) {
@@ -52,8 +51,7 @@ class LockFreeSkipList {
 
 public:
     LockFreeSkipList()
-        : head(new LFNode(std::numeric_limits<int>::min(), MAX_LEVEL)),
-          current_level(1) {}
+        : head(new LFNode(std::numeric_limits<int>::min(), MAX_LEVEL)) {}
 
     ~LockFreeSkipList() {
         LFNode* curr = get_ptr(head->next[0].load());
@@ -75,7 +73,15 @@ public:
     bool find(int key, LFNode** preds, LFNode** succs) {
     retry:
         LFNode* pred = head;
-        for (int i = current_level.load(std::memory_order_relaxed) - 1; i >= 0; i--) {
+        // Always walk every level, rather than bounding the search by a "highest
+        // level in use" hint. A hint like that is only updated by insert() after
+        // a node is already linked at every level, so a concurrent remove() could
+        // retire a node that's still legitimately linked above the hint's current
+        // value -- the node would look "already gone" to a bounded search while a
+        // real pointer to it still exists higher up. MAX_LEVEL is small (16) and
+        // head always has all 16 slots allocated, so scanning unconditionally
+        // costs nothing on levels nothing has been inserted at.
+        for (int i = MAX_LEVEL - 1; i >= 0; i--) {
             LFNode* curr = get_ptr(pred->next[i].load(std::memory_order_acquire));
             while (curr) {
                 uint64_t raw = curr->next[i].load(std::memory_order_acquire);
@@ -119,12 +125,6 @@ public:
             if (find(key, preds, succs))
                 return false;
 
-            int cl = current_level.load(std::memory_order_relaxed);
-            for (int i = cl; i < lvl; i++) {
-                preds[i] = head;
-                succs[i] = nullptr;
-            }
-
             LFNode* node = new LFNode(key, lvl);
             for (int i = 0; i < lvl; i++)
                 node->next[i].store(pack(succs[i], false), std::memory_order_relaxed);
@@ -141,19 +141,48 @@ public:
 
             for (int i = 1; i < lvl; i++) {
                 while (true) {
-                    expected = pack(succs[i], false);
+                    // A concurrent remove() can mark and retire this node while
+                    // we're still linking it in at higher levels; linking it in
+                    // anyway would resurrect a pointer to a node that's on its way
+                    // to being freed. Bail out and let find()'s helping logic
+                    // (which now always walks every level, see find() above)
+                    // unlink whatever levels we already linked.
+                    uint64_t self = node->next[i].load(std::memory_order_acquire);
+                    if (get_mark(self)) {
+                        find(key, preds, succs);
+                        return true;
+                    }
+                    // node->next[i] was only set once, at construction, from
+                    // whichever succs[i] find() had at that moment. If a CAS
+                    // below failed and find() refreshed succs[i] since, node's own
+                    // pointer is now stale relative to what we're about to link
+                    // against -- syncing it (via CAS, so we don't clobber a mark
+                    // that lands concurrently) keeps it consistent with whatever
+                    // successor the upcoming link CAS actually validates against.
+                    uint64_t desired = pack(succs[i], false);
+                    if (self != desired && !node->next[i].compare_exchange_strong(
+                            self, desired, std::memory_order_acq_rel, std::memory_order_acquire))
+                        continue;
+
+                    expected = desired;
                     if (preds[i]->next[i].compare_exchange_strong(
                             expected,
                             pack(node, false),
                             std::memory_order_acq_rel,
-                            std::memory_order_acquire))
+                            std::memory_order_acquire)) {
+                        // A concurrent remove() could have marked (and retired) the
+                        // node in the instant between our check above and this CAS
+                        // landing. Re-check right away rather than moving on to the
+                        // next level with an unnoticed ghost link left behind.
+                        if (get_mark(node->next[i].load(std::memory_order_acquire))) {
+                            find(key, preds, succs);
+                            return true;
+                        }
                         break;
+                    }
                     find(key, preds, succs);
                 }
             }
-
-            int observed = current_level.load(std::memory_order_relaxed);
-            while (observed < lvl && !current_level.compare_exchange_weak(observed, lvl, std::memory_order_relaxed));
 
             return true;
         }

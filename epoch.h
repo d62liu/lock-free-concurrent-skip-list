@@ -88,7 +88,18 @@ public:
         // Hand a fully-unlinked node to the reclaimer. Must be called at most once
         // per node, by whichever thread observed it leave the structure.
         void retire(void* p, void (*deleter)(void*)) {
-            uint64_t g = tc->epoch.load(std::memory_order_relaxed);
+            // Tag with the epoch *now*, not tc->epoch (this thread's own epoch as
+            // of when it pinned, possibly long ago). A slow remove() -- stuck in
+            // CAS retries -- can still be unlinking the node well after some other
+            // thread has since pinned at a much later epoch and legitimately read
+            // a valid pointer into it. Tagging with the stale pin epoch starts the
+            // 2-epoch clock from that earlier point and can let the free fire
+            // before that other thread ever finishes. A fresh read, taken after
+            // the physical unlink this same thread just performed, is guaranteed
+            // >= the pin epoch of any thread that could still hold a pointer
+            // grabbed before the unlink -- global_epoch only moves forward, and
+            // such a thread must have pinned before this point in real time.
+            uint64_t g = ebr->global_epoch.load(std::memory_order_seq_cst);
             tc->bags[g % NUM_BAGS].push_back({p, deleter});
             if (++tc->since_advance >= kAdvanceEvery) {
                 tc->since_advance = 0;
@@ -99,6 +110,16 @@ public:
 
 private:
     static constexpr unsigned kAdvanceEvery = 64;
+
+    // Identifies this EBR instance for the thread-local cache in local(). Must
+    // not be the instance's address: a short-lived EBR (e.g. a stack-allocated
+    // skip list inside a loop) can be destroyed and a new one constructed at the
+    // exact same address, which would make a stale thread_local cache believe
+    // it already has a valid ThreadCtl for the new instance -- it doesn't, that
+    // ThreadCtl was freed by the old instance's destructor. A monotonically
+    // increasing id, never reused, closes that hole.
+    inline static std::atomic<uint64_t> next_id{1};
+    const uint64_t id = next_id.fetch_add(1, std::memory_order_relaxed);
 
     std::atomic<uint64_t> global_epoch;
     std::atomic<ThreadCtl*> registry;
@@ -114,15 +135,15 @@ private:
     // original registry and is freed by that EBR's destructor.
     ThreadCtl* local() {
         thread_local ThreadCtl* tc = nullptr;
-        thread_local EBR* owner = nullptr;
-        if (tc == nullptr || owner != this) {
+        thread_local uint64_t owner_id = 0;
+        if (tc == nullptr || owner_id != id) {
             tc = new ThreadCtl();
             ThreadCtl* head = registry.load(std::memory_order_relaxed);
             do {
                 tc->next = head;
             } while (!registry.compare_exchange_weak(
                 head, tc, std::memory_order_release, std::memory_order_relaxed));
-            owner = this;
+            owner_id = id;
         }
         return tc;
     }
